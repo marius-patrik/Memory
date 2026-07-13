@@ -8,6 +8,8 @@ import {
   rebuildMemoryProjections,
   renderStartupMemory,
 } from "../../../packages/manager/src/memory";
+import { enableEventSync, exportEventBundle, importEventBundle } from "../../../packages/manager/src/event-sync";
+import { writeSecret } from "../../../packages/manager/src/secrets";
 import { ensureSharedState, sharedStateAt, type SharedState } from "../../../packages/manager/src/state";
 import { createSession, loadSessionEvents, withSessionWriteTransaction } from "../../../packages/harness/session";
 import {
@@ -16,6 +18,7 @@ import {
   migrateDreamV13Cursor,
   processHistoricalCorpus,
   reflectCanonicalSession,
+  restoreDreamV13CursorProjection,
   runIdleDreamCycle,
   type DreamV13Cursor,
 } from "../src/index";
@@ -108,6 +111,14 @@ describe("canonical reflection and dreams", () => {
       expect(records.filter((record) => record.status === "active")).toHaveLength(1);
       expect(records.filter((record) => record.status === "superseded")).toHaveLength(1);
       expect(records.find((record) => record.status === "active")?.value).toContain("Preserve unrelated worktree changes.");
+      await expect(
+        runIdleDreamCycle(state, {
+          now: new Date(latestSecond + 4 * 60 * 60_000),
+          minimumIdleMs: 60 * 60_000,
+          maximumSessions: 1,
+          maximumScannedSessions: 1,
+        }),
+      ).rejects.toThrow(/exceeds maximumSessions 1/);
       expect((await inspectMemoryIntegrity(state)).ok).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -190,6 +201,51 @@ describe("historical corpus admission", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("bounds directory traversal before reading corpus content", async () => {
+    const { root } = await fixture();
+    try {
+      const corpus = path.join(root, "deep-corpus");
+      await mkdir(path.join(corpus, "one", "two"), { recursive: true });
+      await writeFile(path.join(corpus, "one", "two", "session.txt"), "safe historical note");
+      await expect(processHistoricalCorpus(corpus, { maxDepth: 1 })).rejects.toThrow(/maximum directory depth 1/);
+      await expect(processHistoricalCorpus(corpus, { maxDirectories: 2 })).rejects.toThrow(/maximum directory count 2/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("operator entrypoint", () => {
+  test("runs status against only the explicitly rooted disposable state", async () => {
+    const { root, state } = await fixture();
+    try {
+      const child = Bun.spawn(["bun", path.resolve(import.meta.dir, "../src/cli.ts"), "status"], {
+        cwd: root,
+        env: {
+          ...process.env,
+          AGENTS_ROOT: root,
+          AGENTS_HOME: state.stateDir,
+          AGENTS_USER_HOME: state.userHome,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(stderr).toBe("");
+      expect(exitCode).toBe(0);
+      expect(JSON.parse(stdout)).toMatchObject({
+        records: { reflection: 0, dream: 0, corpus: 0, migration: 0 },
+        migration: null,
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("Dream v1.3 cursor migration", () => {
@@ -207,8 +263,9 @@ describe("Dream v1.3 cursor migration", () => {
     provider_counts: { claude: 165, kimi: 31, codex: 166, agy: 6 },
   };
 
-  test("preserves the full v1.3 cursor and source bytes while rejecting older formats", async () => {
+  test("preserves the full v1.3 cursor in canonical events and restores its runtime projection after sync", async () => {
     const { root, state } = await fixture();
+    const targetFixture = await fixture();
     try {
       const oldSource = path.join(root, "dream-v1.1.json");
       await writeFile(oldSource, `${JSON.stringify({ ...cursor, version: "1.1" }, null, 2)}\n`);
@@ -228,6 +285,11 @@ describe("Dream v1.3 cursor migration", () => {
       expect(migrated.canonicalCursor).toEqual({ lastSessionEventAt: null, lastSessionEventHash: null });
       expect(migrated.source.contentHash).toMatch(/^[a-f0-9]{64}$/);
       expect(await readFile(source, "utf8")).toBe(sourceBytes);
+      const authority = await listMemoryRecords(state, { scope: "memory-plugin", status: "active" });
+      expect(authority).toHaveLength(1);
+      expect(authority[0].id).toBe(migrated.recordId);
+      expect(authority[0].sensitivity).toBe("sensitive");
+      expect((await renderStartupMemory(state)).content).not.toContain("provider_raw");
 
       const repeated = await migrateDreamV13Cursor(state, source, {
         now: new Date("2026-07-14T12:00:00.000Z"),
@@ -235,8 +297,26 @@ describe("Dream v1.3 cursor migration", () => {
       expect(repeated).toEqual(migrated);
       const onDisk = JSON.parse(await readFile(dreamCursorPath(state), "utf8"));
       expect(onDisk).toEqual(migrated);
+
+      await rm(dreamCursorPath(state), { force: true });
+      await rebuildMemoryProjections(state);
+      expect(await restoreDreamV13CursorProjection(state)).toEqual(migrated);
+
+      const syncKey = "7b".repeat(32);
+      await writeSecret(state, "AGENTS_SYNC_KEY", syncKey);
+      await writeSecret(targetFixture.state, "AGENTS_SYNC_KEY", syncKey);
+      await enableEventSync(state);
+      await enableEventSync(targetFixture.state);
+      const bundle = path.join(root, "memory-events.bundle.json");
+      await exportEventBundle(state, bundle);
+      await importEventBundle(targetFixture.state, bundle);
+      const restored = await restoreDreamV13CursorProjection(targetFixture.state);
+      expect(restored.legacyCursor).toEqual(cursor);
+      expect(restored.source).toEqual(migrated.source);
+      expect((await inspectMemoryIntegrity(targetFixture.state)).ok).toBe(true);
     } finally {
       await rm(root, { recursive: true, force: true });
+      await rm(targetFixture.root, { recursive: true, force: true });
     }
   });
 });

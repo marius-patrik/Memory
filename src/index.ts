@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { lstat, opendir, readFile } from "node:fs/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { lstat, open, opendir, readFile, realpath } from "node:fs/promises";
+import { findSecretLikePath } from "../../../packages/manager/src/event-sync";
 import {
   listMemoryRecords,
   rememberMemory,
@@ -13,11 +14,7 @@ import {
 } from "../../../packages/manager/src/memory";
 import type { SharedState } from "../../../packages/manager/src/state";
 import { writeTextAtomic } from "../../../packages/manager/src/state-v2";
-import {
-  listSessions,
-  loadSessionEvents,
-  type SessionEvent,
-} from "../../../packages/harness/session";
+import { listSessionIds, loadSessionEvents, type SessionEvent } from "../../../packages/harness/session";
 
 export const MEMORY_PLUGIN_SCHEMA_VERSION = 1 as const;
 export const DREAM_V13_CURSOR_VERSION = "1.3" as const;
@@ -27,16 +24,12 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const MAX_CANDIDATE_TEXT = 480;
 const DEFAULT_MAX_CORPUS_FILES = 1_000;
 const DEFAULT_MAX_CORPUS_FILE_BYTES = 1024 * 1024;
-const SECRET_PATTERNS = [
-  /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/i,
-  /\bsecret:\/\//i,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}/i,
-  /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,})\b/,
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
-  /["']?(?:password|passwd|token|secret|api[_-]?key)["']?\s*(?::|=|\bis\b)\s*["']?[^\s"']{8,}/i,
-];
+const DEFAULT_MAX_CORPUS_DIRECTORIES = 10_000;
+const DEFAULT_MAX_CORPUS_DEPTH = 64;
+const DEFAULT_MAX_CORPUS_TOTAL_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_SCANNED_SESSIONS = 1_000;
 
-export type MemoryCandidateKind = "reflection" | "dream" | "corpus";
+export type MemoryCandidateKind = "reflection" | "dream" | "corpus" | "migration";
 
 export interface MemoryCandidate {
   schemaVersion: typeof MEMORY_PLUGIN_SCHEMA_VERSION;
@@ -90,11 +83,32 @@ export interface MigratedDreamCursor {
     uri: string;
     contentHash: string;
   };
+  recordId: string;
   legacyCursor: DreamV13Cursor;
   canonicalCursor: {
     lastSessionEventAt: null;
     lastSessionEventHash: null;
   };
+}
+
+interface DreamCursorAuthority {
+  schemaVersion: typeof MEMORY_PLUGIN_SCHEMA_VERSION;
+  version: typeof DREAM_V13_CURSOR_VERSION;
+  lastRun: string;
+  lastProcessed: {
+    timeKey: string;
+    provider: string;
+    sourceKind: string;
+    pathStyle: "windows" | "posix";
+    pathUri: string;
+  };
+  processedTotal: number;
+  lastSessionTitleUri: string;
+  pendingCount: number;
+  openItems: string[];
+  nextWork: string[];
+  sourceCounts: Record<string, number>;
+  providerCounts: Record<string, number>;
 }
 
 function requiredText(value: unknown, label: string): string {
@@ -144,13 +158,9 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function containsSecretLikeText(value: string): boolean {
-  return SECRET_PATTERNS.some((pattern) => pattern.test(value));
-}
-
 function candidateText(value: string): string | null {
   const normalized = value.replace(/\s+/g, " ").trim();
-  if (!normalized || containsSecretLikeText(normalized)) return null;
+  if (!normalized || findSecretLikePath(normalized)) return null;
   return normalized.length > MAX_CANDIDATE_TEXT ? `${normalized.slice(0, MAX_CANDIDATE_TEXT - 1)}…` : normalized;
 }
 
@@ -165,7 +175,7 @@ function assistantTexts(events: SessionEvent[]): string[] {
 function validateCandidate(candidate: MemoryCandidate): MemoryCandidate {
   if (candidate.schemaVersion !== MEMORY_PLUGIN_SCHEMA_VERSION) throw new Error("unsupported memory candidate schema");
   if (!SHA256.test(candidate.evidence.contentHash)) throw new Error("candidate evidence hash must be lowercase SHA-256");
-  if (containsSecretLikeText(candidate.value) || candidate.sensitivity === ("secret" as MemorySensitivity)) {
+  if (findSecretLikePath(candidate.value) || candidate.sensitivity === ("secret" as MemorySensitivity)) {
     throw new Error("secret-like values cannot cross the memory plugin boundary");
   }
   requiredTimestamp(candidate.observedAt, "candidate observedAt");
@@ -176,6 +186,25 @@ function latestEventAt(events: SessionEvent[]): string {
   const latest = events.at(-1)?.at;
   if (!latest) throw new Error("canonical session has no events");
   return latest;
+}
+
+async function loadBoundedSessionEvents(
+  state: SharedState,
+  sessionIds: string[],
+  concurrency = 8,
+): Promise<Array<{ sessionId: string; events: SessionEvent[] }>> {
+  const output = new Array<{ sessionId: string; events: SessionEvent[] }>(sessionIds.length);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < sessionIds.length) {
+      const index = cursor;
+      cursor += 1;
+      const sessionId = sessionIds[index];
+      output[index] = { sessionId, events: await loadSessionEvents(state, sessionId) };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, sessionIds.length) }, () => worker()));
+  return output;
 }
 
 export async function reflectCanonicalSession(
@@ -257,20 +286,23 @@ export async function runIdleDreamCycle(
     now?: Date;
     minimumIdleMs?: number;
     maximumSessions?: number;
+    maximumScannedSessions?: number;
     authorId?: string;
   } = {},
 ): Promise<DreamCycleResult> {
   const now = options.now ?? new Date();
   const minimumIdleMs = options.minimumIdleMs ?? DEFAULT_DREAM_IDLE_MS;
   const maximumSessions = options.maximumSessions ?? 8;
+  const maximumScannedSessions = options.maximumScannedSessions ?? DEFAULT_MAX_SCANNED_SESSIONS;
   if (!Number.isFinite(minimumIdleMs) || minimumIdleMs < 0) throw new Error("minimumIdleMs must be non-negative");
   if (!Number.isSafeInteger(maximumSessions) || maximumSessions < 1 || maximumSessions > 100) {
     throw new Error("maximumSessions must be an integer between 1 and 100");
   }
-  const descriptors = await listSessions(state);
-  const sessions = await Promise.all(
-    descriptors.map(async ({ sessionId }) => ({ sessionId, events: await loadSessionEvents(state, sessionId) })),
-  );
+  if (!Number.isSafeInteger(maximumScannedSessions) || maximumScannedSessions < maximumSessions) {
+    throw new Error("maximumScannedSessions must be an integer greater than or equal to maximumSessions");
+  }
+  const sessionIds = await listSessionIds(state, { maximumSessions: maximumScannedSessions });
+  const sessions = await loadBoundedSessionEvents(state, sessionIds);
   const nonEmpty = sessions.filter((session) => session.events.length > 0);
   if (nonEmpty.length === 0) return { status: "skipped", reason: "no-sessions" };
   const latestAt = nonEmpty
@@ -315,26 +347,78 @@ export async function runIdleDreamCycle(
   return { status: "recorded", idleForMs, candidate, record };
 }
 
-async function corpusFiles(root: string, maxFiles: number): Promise<string[]> {
+function assertContainedPath(root: string, candidate: string, label: string): void {
+  const relative = path.relative(root, candidate);
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${label} escaped its declared root: ${candidate}`);
+  }
+}
+
+async function corpusFiles(
+  root: string,
+  limits: { maxFiles: number; maxDirectories: number; maxDepth: number },
+): Promise<string[]> {
   const rootInfo = await lstat(root);
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("corpus root must be a regular directory");
+  const physicalRoot = await realpath(root);
+  assertContainedPath(root, physicalRoot, "corpus root");
   const files: string[] = [];
-  const visit = async (directory: string): Promise<void> => {
+  let directories = 0;
+  const visit = async (directory: string, depth: number): Promise<void> => {
+    if (depth > limits.maxDepth) throw new Error(`corpus exceeds maximum directory depth ${limits.maxDepth}`);
+    directories += 1;
+    if (directories > limits.maxDirectories) {
+      throw new Error(`corpus exceeds maximum directory count ${limits.maxDirectories}`);
+    }
+    const physicalDirectory = await realpath(directory);
+    assertContainedPath(physicalRoot, physicalDirectory, "corpus directory");
     for await (const entry of await opendir(directory)) {
       const absolute = path.join(directory, entry.name);
       const info = await lstat(absolute);
       if (info.isSymbolicLink()) throw new Error(`corpus links are not admitted: ${absolute}`);
-      if (info.isDirectory()) await visit(absolute);
+      if (info.isDirectory()) await visit(absolute, depth + 1);
       else if (info.isFile()) {
         files.push(absolute);
-        if (files.length > maxFiles) throw new Error(`corpus exceeds maximum file count ${maxFiles}`);
+        if (files.length > limits.maxFiles) throw new Error(`corpus exceeds maximum file count ${limits.maxFiles}`);
       } else {
         throw new Error(`corpus contains an unsupported filesystem entry: ${absolute}`);
       }
     }
   };
-  await visit(root);
+  await visit(root, 0);
   return files.sort((left, right) => left.localeCompare(right));
+}
+
+async function readPhysicalCorpusFile(root: string, absolute: string, maxFileBytes: number): Promise<{
+  bytes: Buffer;
+  modifiedAt: Date;
+}> {
+  const physical = await realpath(absolute);
+  assertContainedPath(root, physical, "corpus file");
+  const before = await lstat(absolute);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error(`corpus file is not physical: ${absolute}`);
+  if (before.size > maxFileBytes) throw new Error("corpus-file-too-large");
+  const handle = await open(absolute, "r");
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new Error(`corpus file changed during admission: ${absolute}`);
+    }
+    const bytes = await handle.readFile();
+    const after = await lstat(absolute);
+    if (
+      !after.isFile() ||
+      after.isSymbolicLink() ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      after.size !== opened.size
+    ) {
+      throw new Error(`corpus file changed during admission: ${absolute}`);
+    }
+    return { bytes, modifiedAt: opened.mtime };
+  } finally {
+    await handle.close();
+  }
 }
 
 function findMessageContent(value: unknown, output: string[]): void {
@@ -394,16 +478,33 @@ function extractCorpusCandidate(content: string, extension: string): string | nu
 
 export async function processHistoricalCorpus(
   rootInput: string,
-  options: { maxFiles?: number; maxFileBytes?: number; observedAt?: Date } = {},
+  options: {
+    maxFiles?: number;
+    maxDirectories?: number;
+    maxDepth?: number;
+    maxFileBytes?: number;
+    maxTotalBytes?: number;
+    observedAt?: Date;
+  } = {},
 ): Promise<CorpusBatchResult> {
   const root = path.resolve(rootInput);
   const maxFiles = options.maxFiles ?? DEFAULT_MAX_CORPUS_FILES;
+  const maxDirectories = options.maxDirectories ?? DEFAULT_MAX_CORPUS_DIRECTORIES;
+  const maxDepth = options.maxDepth ?? DEFAULT_MAX_CORPUS_DEPTH;
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_CORPUS_FILE_BYTES;
+  const maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_CORPUS_TOTAL_BYTES;
   if (!Number.isSafeInteger(maxFiles) || maxFiles < 1) throw new Error("maxFiles must be a positive integer");
+  if (!Number.isSafeInteger(maxDirectories) || maxDirectories < 1) {
+    throw new Error("maxDirectories must be a positive integer");
+  }
+  if (!Number.isSafeInteger(maxDepth) || maxDepth < 0) throw new Error("maxDepth must be a non-negative integer");
   if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1) throw new Error("maxFileBytes must be a positive integer");
+  if (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes < 1) throw new Error("maxTotalBytes must be a positive integer");
   const candidates: MemoryCandidate[] = [];
   const skipped: CorpusSkip[] = [];
-  for (const absolute of await corpusFiles(root, maxFiles)) {
+  let admittedBytes = 0;
+  const physicalRoot = await realpath(root);
+  for (const absolute of await corpusFiles(root, { maxFiles, maxDirectories, maxDepth })) {
     const relativePath = path.relative(root, absolute).split(path.sep).join("/");
     if (!relativePath || relativePath.startsWith("../") || path.isAbsolute(relativePath)) {
       throw new Error(`corpus path escaped its declared root: ${absolute}`);
@@ -413,14 +514,21 @@ export async function processHistoricalCorpus(
       skipped.push({ relativePath, reason: "unsupported" });
       continue;
     }
-    const info = await lstat(absolute);
-    if (info.size > maxFileBytes) {
-      skipped.push({ relativePath, reason: "too-large" });
-      continue;
+    let admitted;
+    try {
+      admitted = await readPhysicalCorpusFile(physicalRoot, absolute, maxFileBytes);
+    } catch (error) {
+      if ((error as Error).message === "corpus-file-too-large") {
+        skipped.push({ relativePath, reason: "too-large" });
+        continue;
+      }
+      throw error;
     }
-    const bytes = await readFile(absolute);
+    const { bytes, modifiedAt } = admitted;
+    admittedBytes += bytes.byteLength;
+    if (admittedBytes > maxTotalBytes) throw new Error(`corpus exceeds maximum total bytes ${maxTotalBytes}`);
     const content = bytes.toString("utf8");
-    if (containsSecretLikeText(content)) {
+    if (findSecretLikePath(content)) {
       skipped.push({ relativePath, reason: "secret-like" });
       continue;
     }
@@ -444,7 +552,7 @@ export async function processHistoricalCorpus(
           confidence: 0.5,
         },
         sensitivity: "internal",
-        observedAt: (options.observedAt ?? info.mtime).toISOString(),
+        observedAt: (options.observedAt ?? modifiedAt).toISOString(),
         status: "active",
       }),
     );
@@ -496,6 +604,125 @@ export function dreamCursorPath(state: SharedState): string {
   return path.join(state.stateDir, "runtime", "plugins", "memory", "dream-v1.3-cursor.json");
 }
 
+function cursorPathUri(rawPath: string): { pathStyle: "windows" | "posix"; pathUri: string } {
+  if (/^[A-Za-z]:\\/.test(rawPath)) {
+    const normalized = rawPath.replaceAll("\\", "/");
+    const drive = normalized.slice(0, 2);
+    const tail = normalized
+      .slice(3)
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    return { pathStyle: "windows", pathUri: `file:///${drive}/${tail}` };
+  }
+  if (!rawPath.startsWith("/")) throw new Error("Dream cursor timeline path must be absolute");
+  return { pathStyle: "posix", pathUri: pathToFileURL(rawPath).href };
+}
+
+function authorityFromCursor(cursor: DreamV13Cursor): DreamCursorAuthority {
+  const parts = cursor.last_processed_file.split("|");
+  if (parts.length < 4) throw new Error("Dream cursor last_processed_file must use the v1.3 temporal cursor format");
+  const [timeKey, provider, sourceKind, ...pathParts] = parts;
+  if (!/^\d{17}$/.test(timeKey)) throw new Error("Dream cursor time key must contain 17 digits");
+  const rawPath = pathParts.join("|");
+  const encodedPath = cursorPathUri(rawPath);
+  const authority: DreamCursorAuthority = {
+    schemaVersion: MEMORY_PLUGIN_SCHEMA_VERSION,
+    version: DREAM_V13_CURSOR_VERSION,
+    lastRun: cursor.last_run,
+    lastProcessed: {
+      timeKey,
+      provider: requiredText(provider, "Dream cursor provider"),
+      sourceKind: requiredText(sourceKind, "Dream cursor source kind"),
+      ...encodedPath,
+    },
+    processedTotal: cursor.processed_total,
+    lastSessionTitleUri: `file:///dream-session-title/${encodeURIComponent(cursor.last_session_title)}`,
+    pendingCount: cursor.pending_count,
+    openItems: [...cursor.open_items],
+    nextWork: [...cursor.next_work],
+    sourceCounts: { ...cursor.source_counts },
+    providerCounts: { ...cursor.provider_counts },
+  };
+  const plantedSecret = findSecretLikePath(authority);
+  if (plantedSecret) throw new Error(`Dream cursor contains secret-like content at ${plantedSecret}`);
+  return authority;
+}
+
+function cursorFromAuthority(value: unknown): DreamV13Cursor {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Dream cursor authority must be an object");
+  const authority = value as Partial<DreamCursorAuthority>;
+  if (authority.schemaVersion !== MEMORY_PLUGIN_SCHEMA_VERSION || authority.version !== DREAM_V13_CURSOR_VERSION) {
+    throw new Error("Dream cursor authority schema is unsupported");
+  }
+  if (!authority.lastProcessed || typeof authority.lastProcessed !== "object") {
+    throw new Error("Dream cursor authority is missing its temporal cursor");
+  }
+  const temporal = authority.lastProcessed;
+  const pathUri = requiredText(temporal.pathUri, "Dream cursor authority path URI");
+  const parsedUri = new URL(pathUri);
+  if (parsedUri.protocol !== "file:") throw new Error("Dream cursor authority path URI must use file:");
+  let rawPath: string;
+  if (temporal.pathStyle === "windows") {
+    rawPath = decodeURIComponent(parsedUri.pathname).replace(/^\/([A-Za-z]:)/, "$1").replaceAll("/", "\\");
+  } else if (temporal.pathStyle === "posix") {
+    rawPath = fileURLToPath(parsedUri);
+  } else {
+    throw new Error("Dream cursor authority path style is unsupported");
+  }
+  const titleUri = new URL(requiredText(authority.lastSessionTitleUri, "Dream cursor authority title URI"));
+  if (titleUri.protocol !== "file:") throw new Error("Dream cursor authority title URI must use file:");
+  const title = decodeURIComponent(titleUri.pathname.split("/").at(-1) ?? "");
+  return validateDreamV13Cursor({
+    version: DREAM_V13_CURSOR_VERSION,
+    last_run: authority.lastRun,
+    last_processed_file: [
+      requiredText(temporal.timeKey, "Dream cursor authority time key"),
+      requiredText(temporal.provider, "Dream cursor authority provider"),
+      requiredText(temporal.sourceKind, "Dream cursor authority source kind"),
+      rawPath,
+    ].join("|"),
+    processed_total: authority.processedTotal,
+    last_session_title: title,
+    pending_count: authority.pendingCount,
+    open_items: authority.openItems,
+    next_work: authority.nextWork,
+    source_counts: authority.sourceCounts,
+    provider_counts: authority.providerCounts,
+  });
+}
+
+function migratedEnvelope(record: MemoryRecord): MigratedDreamCursor {
+  if (typeof record.value !== "string") throw new Error("canonical Dream cursor authority must be a string scalar");
+  const cursor = cursorFromAuthority(JSON.parse(record.value) as unknown);
+  return {
+    schemaVersion: MEMORY_PLUGIN_SCHEMA_VERSION,
+    kind: "dream-v1.3-cursor",
+    migratedAt: record.createdAt,
+    source: { uri: record.evidence.uri, contentHash: record.evidence.contentHash },
+    recordId: record.id,
+    legacyCursor: cursor,
+    canonicalCursor: { lastSessionEventAt: null, lastSessionEventHash: null },
+  };
+}
+
+async function publishDreamCursorProjection(state: SharedState, record: MemoryRecord): Promise<MigratedDreamCursor> {
+  const migrated = migratedEnvelope(record);
+  await writeTextAtomic(dreamCursorPath(state), `${JSON.stringify(migrated, null, 2)}\n`);
+  return migrated;
+}
+
+export async function restoreDreamV13CursorProjection(state: SharedState): Promise<MigratedDreamCursor> {
+  const records = await listMemoryRecords(state, {
+    scope: "memory-plugin",
+    subject: "dream-v1.3",
+    predicate: "cursor-authority",
+    status: "active",
+  });
+  if (records.length !== 1) throw new Error(`expected one active canonical Dream cursor record, found ${records.length}`);
+  return publishDreamCursorProjection(state, records[0]);
+}
+
 export async function migrateDreamV13Cursor(
   state: SharedState,
   sourcePathInput: string,
@@ -505,7 +732,17 @@ export async function migrateDreamV13Cursor(
   const sourceInfo = await lstat(sourcePath);
   if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) throw new Error("Dream cursor source must be a regular file");
   if (sourceInfo.size > 1024 * 1024) throw new Error("Dream cursor source exceeds the admission size limit");
-  const sourceBytes = await readFile(sourcePath);
+  const sourceHandle = await open(sourcePath, "r");
+  let sourceBytes: Buffer;
+  try {
+    const opened = await sourceHandle.stat();
+    if (!opened.isFile() || opened.dev !== sourceInfo.dev || opened.ino !== sourceInfo.ino || opened.size !== sourceInfo.size) {
+      throw new Error("Dream cursor source changed during admission");
+    }
+    sourceBytes = await sourceHandle.readFile();
+  } finally {
+    await sourceHandle.close();
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(sourceBytes.toString("utf8"));
@@ -513,29 +750,58 @@ export async function migrateDreamV13Cursor(
     throw new Error("Dream cursor source is not valid JSON");
   }
   const sourceHash = sha256(sourceBytes);
-  const destination = dreamCursorPath(state);
-  try {
-    const existingInfo = await lstat(destination);
-    if (!existingInfo.isFile() || existingInfo.isSymbolicLink()) {
-      throw new Error("migrated Dream cursor destination must be a regular file");
-    }
-    const existing = JSON.parse(await readFile(destination, "utf8")) as MigratedDreamCursor;
-    if (existing.source?.contentHash !== sourceHash) {
-      throw new Error("a different Dream cursor has already been migrated; refusing to overwrite preserved state");
-    }
-    validateDreamV13Cursor(existing.legacyCursor);
-    return existing;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const migrated: MigratedDreamCursor = {
-    schemaVersion: MEMORY_PLUGIN_SCHEMA_VERSION,
-    kind: "dream-v1.3-cursor",
-    migratedAt: (options.now ?? new Date()).toISOString(),
-    source: { uri: pathToFileURL(sourcePath).href, contentHash: sourceHash },
-    legacyCursor: validateDreamV13Cursor(parsed),
-    canonicalCursor: { lastSessionEventAt: null, lastSessionEventHash: null },
+  const cursor = validateDreamV13Cursor(parsed);
+  const authority = authorityFromCursor(cursor);
+  const record = await applyMemoryCandidate(
+    state,
+    {
+      schemaVersion: MEMORY_PLUGIN_SCHEMA_VERSION,
+      kind: "migration",
+      scope: "memory-plugin",
+      subject: "dream-v1.3",
+      predicate: "cursor-authority",
+      value: canonicalJson(authority),
+      evidence: {
+        uri: pathToFileURL(sourcePath).href,
+        contentHash: sourceHash,
+        sourceClass: "verified",
+        confidence: 1,
+      },
+      sensitivity: "sensitive",
+      observedAt: cursor.last_run,
+      status: "active",
+    },
+    { now: options.now, authorId: "memory-plugin:migration" },
+  );
+  return publishDreamCursorProjection(state, record);
+}
+
+export async function memoryPluginStatus(state: SharedState): Promise<{
+  records: Record<MemoryCandidateKind, number>;
+  migration: null | { recordId: string; observedAt: string; contentHash: string };
+  cursorProjection: string;
+}> {
+  const records = await listMemoryRecords(state);
+  const owned = records.filter((record) =>
+    ["reflection", "dream", "corpus", "memory-plugin"].includes(record.scope),
+  );
+  const migration = owned.find(
+    (record) =>
+      record.scope === "memory-plugin" &&
+      record.subject === "dream-v1.3" &&
+      record.predicate === "cursor-authority" &&
+      record.status === "active",
+  );
+  return {
+    records: {
+      reflection: owned.filter((record) => record.scope === "reflection").length,
+      dream: owned.filter((record) => record.scope === "dream").length,
+      corpus: owned.filter((record) => record.scope === "corpus").length,
+      migration: owned.filter((record) => record.scope === "memory-plugin").length,
+    },
+    migration: migration
+      ? { recordId: migration.id, observedAt: migration.observedAt, contentHash: migration.evidence.contentHash }
+      : null,
+    cursorProjection: dreamCursorPath(state),
   };
-  await writeTextAtomic(destination, `${JSON.stringify(migrated, null, 2)}\n`);
-  return migrated;
 }
