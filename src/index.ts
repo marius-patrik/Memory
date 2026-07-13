@@ -13,7 +13,10 @@ import {
   type MemorySensitivity,
 } from "../../../packages/manager/src/memory";
 import type { SharedState } from "../../../packages/manager/src/state";
-import { writeTextAtomic } from "../../../packages/manager/src/state-v2";
+import {
+  pluginRuntimeProjectionPath,
+  publishPluginRuntimeProjection,
+} from "../../../packages/manager/src/state-v2";
 import { listSessionIds, loadSessionEvents, type SessionEvent } from "../../../packages/harness/session";
 
 export const MEMORY_PLUGIN_SCHEMA_VERSION = 1 as const;
@@ -601,7 +604,7 @@ function validateDreamV13Cursor(value: unknown): DreamV13Cursor {
 }
 
 export function dreamCursorPath(state: SharedState): string {
-  return path.join(state.stateDir, "runtime", "plugins", "memory", "dream-v1.3-cursor.json");
+  return pluginRuntimeProjectionPath(state, "memory", "dream-v1.3-cursor");
 }
 
 function cursorPathUri(rawPath: string): { pathStyle: "windows" | "posix"; pathUri: string } {
@@ -708,7 +711,7 @@ function migratedEnvelope(record: MemoryRecord): MigratedDreamCursor {
 
 async function publishDreamCursorProjection(state: SharedState, record: MemoryRecord): Promise<MigratedDreamCursor> {
   const migrated = migratedEnvelope(record);
-  await writeTextAtomic(dreamCursorPath(state), `${JSON.stringify(migrated, null, 2)}\n`);
+  await publishPluginRuntimeProjection(state, "memory", "dream-v1.3-cursor", migrated);
   return migrated;
 }
 
