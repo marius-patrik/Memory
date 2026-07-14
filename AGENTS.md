@@ -1,5 +1,6 @@
-# Memory repository guidance
+# Managed repository guidance
 
-Use issue/spec -> feature branch -> validation -> reviewed pull request -> `dev`. Release only through a reviewed `dev` -> `main` pull request.
+Load repository-local guidance from `.agents/.project/` when it exists.
 
-Memory records and cursor authority remain manager-owned canonical events. Provider transcripts and corpus files are evidence only. Never write canonical event or projection files directly, and never admit secret-like content.
+Shared identity, memory, roles, and skills are installed once under
+`$AGENTS_HOME`; managed repositories do not carry a second global agent floor.

@@ -1,3 +1,11 @@
-# Branching policy
+# DarkFactory Branching Policy
 
-`dev` is the integration branch and `main` is the release branch. Both branches require the `Validate` and `Codex Review` checks, reject force pushes and deletion, and accept changes only through current, green pull requests. Feature work targets `dev`; only release pull requests target `main`.
+Managed code repositories use `dev` for work integration and `main` for the
+canonical Agent OS product state.
+
+- Work pull requests target `dev`.
+- Agent OS integration pull requests move reviewed `dev` state to `main`.
+- Component repositories do not define independent version, tag, or release authority.
+- State and data repositories may commit directly to `main` when their own policy permits it.
+
+This policy is owned by the canonical `marius-patrik/agents-manager` source repository.
